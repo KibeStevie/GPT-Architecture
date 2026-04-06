@@ -1,0 +1,5 @@
+.venv/ 
+
+gpt2_models/
+
+_pycache__/
