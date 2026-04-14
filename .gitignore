@@ -2,4 +2,4 @@
 
 gpt2_models/
 
-_pycache__/
+__pycache__/
