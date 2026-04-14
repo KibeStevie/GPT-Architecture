@@ -1,4 +1,3 @@
-# test.py
 import torch
 import json
 import tiktoken
@@ -9,13 +8,9 @@ from gpt_instruction import format_input
 from gpt_train import generate, text_to_token_ids, token_ids_to_text
 
 
-def load_finetuned_model(model_path, config_path, device):
-    """Load a fine-tuned GPT model from saved weights and config."""
-    print(f"📦 Loading model config from: {config_path}")
-    with open(config_path, "r", encoding="utf-8") as f:
-        config = json.load(f)
-    
-    print(f"🤖 Initializing GPTModel with config:")
+def load_finetuned_model(model_path, config, device):
+    """Load a fine-tuned GPT model from saved weights and config dict."""
+    print(f"📦 Initializing model with config:")
     print(f"   • Vocabulary: {config.get('vocab_size', 'N/A')}")
     print(f"   • Context length: {config.get('context_length', 'N/A')}")
     print(f"   • Embedding dim: {config.get('emb_dim', 'N/A')}")
@@ -32,7 +27,7 @@ def load_finetuned_model(model_path, config_path, device):
     total_params = sum(p.numel() for p in model.parameters())
     print(f"✅ Model loaded successfully! ({total_params:,} parameters)")
     
-    return model, config
+    return model
 
 
 def get_user_instruction():
@@ -51,7 +46,6 @@ def get_user_instruction():
             print("⚠️  Please enter a non-empty instruction.")
             continue
         
-        # Format the instruction using your template
         entry = {"instruction": user_input, "input": ""}
         formatted = format_input(entry)
         full_prompt = formatted + "\n\n### Response:\n"
@@ -62,11 +56,9 @@ def get_user_instruction():
 def generate_response(model, tokenizer, prompt, device, config, 
                       max_new_tokens=256, temperature=0.3, top_k=25):
     """Generate a response from the model given a formatted prompt."""
-    # Convert prompt to token IDs
     input_ids = text_to_token_ids(prompt, tokenizer)
     input_ids = input_ids.to(device)
     
-    # Generate tokens
     with torch.no_grad():
         output_ids = generate(
             model=model,
@@ -75,26 +67,20 @@ def generate_response(model, tokenizer, prompt, device, config,
             context_size=config["context_length"],
             temperature=temperature,
             top_k=top_k,
-            eos_id=50256  # GPT-2 EOS token
+            eos_id=50256
         )
     
-    # Decode and extract response
     generated_text = token_ids_to_text(output_ids, tokenizer)
     
-    # Remove the prompt and clean up the response
-    # This extracts only the model's generated response
     if generated_text.startswith(prompt):
         response = generated_text[len(prompt):]
     else:
-        # Fallback: try to find the response marker
         if "### Response:" in generated_text:
             response = generated_text.split("### Response:")[-1]
         else:
             response = generated_text
     
-    # Clean up extra whitespace and markers
     response = response.strip().lstrip("### Response:").strip()
-    
     return response
 
 
@@ -114,10 +100,8 @@ def display_welcome(model_name, device):
 
 
 def main():
-    # ========== STEP 1: Find and Load Model ==========
     print("🔍 Searching for fine-tuned models...\n")
     
-    # Auto-detect saved model files
     model_files = [f for f in os.listdir(".") if f.endswith("-sft-standalone.pth")]
     
     if not model_files:
@@ -125,13 +109,11 @@ def main():
         print("💡 Please run main.py first to train and save a model.\n")
         sys.exit(1)
     
-    # Display available models
     print("✅ Found saved model(s):")
     for i, mf in enumerate(model_files, 1):
         print(f"   {i}. {mf}")
     print()
     
-    # Auto-select if only one, otherwise let user choose
     if len(model_files) == 1:
         selected_file = model_files[0]
         print(f"🎯 Auto-selected: {selected_file}\n")
@@ -148,46 +130,61 @@ def main():
             print("✗ Invalid input. Using first model.")
             selected_file = model_files[0]
     
-    # Derive config file path
     config_file = selected_file.replace(".pth", "_config.json")
-    if not os.path.exists(config_file):
-        print(f"⚠️  Config file not found: {config_file}")
-        print("💡 Please ensure the _config.json file exists alongside the .pth file.\n")
-        sys.exit(1)
     
-    # Setup device
+    # Load or infer config
+    if os.path.exists(config_file):
+        print(f"📦 Loading model config from: {config_file}")
+        with open(config_file, "r", encoding="utf-8") as f:
+            config = json.load(f)
+    else:
+        print(f"⚠️  Config file not found: {config_file}")
+        print("💡 Inferring default GPT-2 configuration from model name...")
+        
+        # ✅ FIXED: qkv_bias set to True, drop_rate to 0.0 to match training config
+        default_configs = {
+            "768": {"vocab_size": 50257, "context_length": 1024, "emb_dim": 768, "n_layers": 12, "n_heads": 12, "drop_rate": 0.0, "qkv_bias": True},
+            "1024": {"vocab_size": 50257, "context_length": 1024, "emb_dim": 1024, "n_layers": 24, "n_heads": 16, "drop_rate": 0.0, "qkv_bias": True},
+            "1280": {"vocab_size": 50257, "context_length": 1024, "emb_dim": 1280, "n_layers": 36, "n_heads": 20, "drop_rate": 0.0, "qkv_bias": True},
+            "1600": {"vocab_size": 50257, "context_length": 1024, "emb_dim": 1600, "n_layers": 48, "n_heads": 25, "drop_rate": 0.0, "qkv_bias": True}
+        }
+        
+        config = None
+        for size, cfg in default_configs.items():
+            if size in selected_file:
+                config = cfg
+                break
+                
+        if config is None:
+            print("❓ Could not infer model size. Defaulting to GPT-2 Small (768).")
+            config = default_configs["768"]
+            
+        print(f"✅ Using inferred config: emb_dim={config['emb_dim']}, n_layers={config['n_layers']}, n_heads={config['n_heads']}")
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Load model
     try:
-        model, config = load_finetuned_model(selected_file, config_file, device)
+        model = load_finetuned_model(selected_file, config, device)
     except Exception as e:
         print(f"✗ Error loading model: {e}")
-        print("💡 Make sure the model and config files are valid and compatible.\n")
+        print("💡 Make sure the model weights match the inferred architecture.\n")
         sys.exit(1)
     
-    # Initialize tokenizer
     print("🔤 Loading tokenizer...")
     tokenizer = tiktoken.get_encoding("gpt2")
     print("✅ Tokenizer ready.\n")
     
-    # Extract model name from filename for display
     model_name = selected_file.replace("-sft-standalone.pth", "").replace("-", " ").title()
     
-    # ========== STEP 2: Interactive Inference Loop ==========
     display_welcome(model_name, device)
-    
     print("🚀 Ready! Ask me anything...\n")
     
     while True:
-        # Get user instruction
         prompt = get_user_instruction()
-        
         if prompt is None:
             print("\n👋 Goodbye! Thanks for testing.\n")
             break
         
-        # Generate response
         print("\n🤖 Thinking...", end="", flush=True)
         
         try:
@@ -198,14 +195,11 @@ def main():
                 device=device,
                 config=config,
                 max_new_tokens=256,
-                temperature=0.3,   # Lower = more deterministic/factual
-                top_k=25           # Focus on likely tokens
+                temperature=0.3,
+                top_k=25
             )
-            
-            # Clear the "Thinking..." message and display response
-            print("\r" + " "*20 + "\r", end="")  # Clear line
+            print("\r" + " "*20 + "\r", end="")
             print(f"\nAssistant: {response}\n")
-            
         except torch.cuda.OutOfMemoryError:
             print("\r" + " "*20 + "\r", end="")
             print("\n✗ Error: GPU out of memory. Try reducing max_new_tokens or using a smaller model.\n")

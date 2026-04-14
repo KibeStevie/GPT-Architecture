@@ -67,29 +67,58 @@ def calc_loss_batch(input_batch, target_batch, model, device):
     loss = torch.nn.functional.cross_entropy(logits.flatten(0, 1), target_batch.flatten())
     return loss
 
-
-def calc_loss_loader(data_loader, model, device, num_batches=None):
-    total_loss = 0.
+def calc_loss_loader(data_loader, model, device, num_batches=None, show_progress=False):
+    total_loss = 0.    
     if len(data_loader) == 0:
         return float("nan")
     elif num_batches is None:
         num_batches = len(data_loader)
     else:
         num_batches = min(num_batches, len(data_loader))
-    for i, (input_batch, target_batch) in enumerate(data_loader):
+    
+    # Create progress bar if requested
+    if show_progress:
+        pbar = tqdm(
+            enumerate(data_loader), 
+            total=num_batches, 
+            desc="📊 Evaluating", 
+            leave=False, 
+            colour='blue',
+            bar_format='{l_bar}{bar:20}{r_bar}{bar:-10b}'
+        )
+    else:
+        pbar = enumerate(data_loader)
+    
+    for i, (input_batch, target_batch) in pbar:
         if i < num_batches:
             loss = calc_loss_batch(input_batch, target_batch, model, device)
             total_loss += loss.item()
+            
+            # Update progress bar with current loss
+            if show_progress:
+                pbar.set_postfix({'loss': f'{loss.item():.3f}'})
         else:
             break
+    
+    # Close progress bar if it was created
+    if show_progress:
+        pbar.close()
+    
     return total_loss / num_batches
 
-
-def evaluate_model(model, train_loader, val_loader, device, eval_iter):
+def evaluate_model(model, train_loader, val_loader, device, eval_iter, show_progress=False):
     model.eval()
     with torch.no_grad():
-        train_loss = calc_loss_loader(train_loader, model, device, num_batches=eval_iter)
-        val_loss = calc_loss_loader(val_loader, model, device, num_batches=eval_iter)
+        train_loss = calc_loss_loader(
+            train_loader, model, device, 
+            num_batches=eval_iter,
+            show_progress=show_progress
+        )
+        val_loss = calc_loss_loader(
+            val_loader, model, device, 
+            num_batches=eval_iter,
+            show_progress=show_progress
+        )
     model.train()
     return train_loss, val_loss
 

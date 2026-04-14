@@ -1,4 +1,3 @@
-import re
 import time
 import json
 import tiktoken
@@ -7,7 +6,8 @@ from torch.utils.data import DataLoader
 from functools import partial
 from gpt_instruction import InstructionDataset, custom_collate_fn, format_input, load_file
 from gpt_model import GPTModel
-from gpt_train import train_model, calc_loss_loader, plot_losses
+from gpt_train import train_model, calc_loss_loader, plot_losses, load_weights_into_gpt
+from gpt_download import download_and_load_gpt2
 import sys
 import os
 
@@ -19,24 +19,66 @@ MODEL_CONFIGS = {
     "gpt2-xl (1558M)": {"emb_dim": 1600, "n_layers": 48, "n_heads": 25},
 }
 
+# Default training parameters
+DEFAULT_PARAMS = {
+    "num_epochs": 2,
+    "learning_rate": 0.00005,
+    "batch_size": 8,
+    "context_length": 1024,
+    "eval_freq": 5,
+}
+
 
 def find_saved_models():
     """Find all saved fine-tuned models in current directory."""
-    model_files = [f for f in os.listdir(".") if f.endswith("-sft-standalone.pth")]
+    model_files = [f for f in os.listdir(".") if f.endswith("-sft-standalone.pth") or f.endswith("-sft-continued.pth")]
     return sorted(model_files)
 
 
-def display_model_selection(model_files):
-    """Display available models for continued training."""
+def find_json_files():
+    """Find all JSON files in current directory (excluding config files)."""
+    json_files = [f for f in os.listdir(".") if f.endswith(".json") and not f.endswith("_config.json") and not f.endswith("_metadata.json")]
+    return sorted(json_files)
+
+
+def display_model_source_selection():
+    """Display options for model source selection."""
     print("\n" + "="*70)
-    print("🔄 CONTINUE TRAINING - Select a Model")
+    print("🎯 MODEL SOURCE SELECTION")
     print("="*70)
-    print("\n📋 Available Fine-Tuned Models:")
+    print("\n📌 Choose where to load the model from:")
     print("-"*70)
+    print("\n  [1] Continue Training on Fine-Tuned Model")
+    print("      • Load previously saved model (*.pth files)")
+    print("      • Continue from where you left off")
+    print("      • Recommended for iterative improvements")
+    print("\n  [2] Start Fresh with Pretrained GPT-2 Model")
+    print("      • Download fresh GPT-2 weights from OpenAI")
+    print("      • Choose from 124M, 355M, 774M, or 1558M")
+    print("      • Recommended for new training experiments")
+    print("\n" + "-"*70)
+    print("💡 Tips:")
+    print("   • Option [1] requires existing .pth files in current directory")
+    print("   • Option [2] will download weights (cached after first download)")
+    print("   • Press 'q' anytime to quit")
+    print("="*70 + "\n")
+
+
+def display_finetuned_models(model_files):
+    """Display available fine-tuned models for selection."""
+    print("\n" + "="*70)
+    print("📋 AVAILABLE FINE-TUNED MODELS")
+    print("="*70)
+    print("\n📁 Found in Current Directory:")
+    print("-"*70)
+    
+    if not model_files:
+        print("   ✗ No fine-tuned models found!")
+        return
     
     for i, mf in enumerate(model_files, 1):
         # Extract model info from filename
-        model_name = mf.replace("-sft-standalone.pth", "").replace("-", " ").title()
+        model_name = mf.replace("-sft-standalone.pth", "").replace("-sft-continued.pth", "").replace("-", " ").title()
         config_file = mf.replace(".pth", "_config.json")
         
         # Try to get config info
@@ -60,14 +102,103 @@ def display_model_selection(model_files):
             pass
     
     print("\n" + "-"*70)
-    print("💡 Tips:")
-    print("   • Select the model you want to continue training")
-    print("   • Make sure the _config.json file exists alongside .pth file")
-    print("   • Press 'q' anytime to quit")
     print("="*70 + "\n")
 
 
-def load_model_for_continuation(model_path, config_path, device):
+def display_pretrained_models():
+    """Display available pretrained GPT-2 models."""
+    print("\n" + "="*70)
+    print("📋 AVAILABLE PRETRAINED GPT-2 MODELS")
+    print("="*70)
+    print("\n🤖 Choose Model Size:")
+    print("-"*70)
+    
+    for i, (name, config) in enumerate(MODEL_CONFIGS.items(), 1):
+        size = name.split("(")[-1].rstrip(")")
+        emb_dim = config["emb_dim"]
+        n_layers = config["n_layers"]
+        
+        # Estimate RAM requirements
+        if "124M" in size:
+            ram = "~2 GB"
+        elif "355M" in size:
+            ram = "~4 GB"
+        elif "774M" in size:
+            ram = "~8 GB"
+        else:
+            ram = "~16 GB"
+        
+        print(f"\n  [{i}] {name}")
+        print(f"      • Embedding dim: {emb_dim}")
+        print(f"      • Transformer layers: {n_layers}")
+        print(f"      • Attention heads: {config['n_heads']}")
+        print(f"      • Estimated RAM: {ram}")
+    
+    print("\n" + "-"*70)
+    print("💡 Tips:")
+    print("   • Start with [1] gpt2-small for faster experimentation")
+    print("   • Larger models perform better but need more resources")
+    print("   • Weights are cached locally after first download")
+    print("="*70 + "\n")
+
+
+def display_json_selection(json_files):
+    """Display available JSON data files for training."""
+    print("\n" + "="*70)
+    print("📁 AVAILABLE TRAINING DATA FILES")
+    print("="*70)
+    print("\n📋 Found JSON Files in Current Directory:")
+    print("-"*70)
+    
+    if not json_files:
+        print("   ✗ No JSON files found!")
+        return
+    
+    for i, jf in enumerate(json_files, 1):
+        # Show file size
+        try:
+            size_kb = os.path.getsize(jf) / 1024
+            if size_kb > 1024:
+                size_display = f"{size_kb/1024:.2f} MB"
+            else:
+                size_display = f"{size_kb:.2f} KB"
+        except:
+            size_display = "Unknown"
+        
+        # Try to count entries in JSON file
+        entry_count = "?"
+        try:
+            with open(jf, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    entry_count = len(data)
+        except:
+            pass
+        
+        print(f"\n  [{i}] {jf}")
+        print(f"      • Size: {size_display}")
+        print(f"      • Entries: {entry_count}")
+    
+    print("\n" + "-"*70)
+    print("="*70 + "\n")
+
+
+def display_default_params():
+    """Display the default training parameters."""
+    print("\n" + "="*70)
+    print("⚙️  DEFAULT TRAINING PARAMETERS")
+    print("="*70)
+    print(f"\n   • Epochs:          {DEFAULT_PARAMS['num_epochs']}")
+    print(f"   • Learning Rate:   {DEFAULT_PARAMS['learning_rate']}")
+    print(f"   • Batch Size:      {DEFAULT_PARAMS['batch_size']}")
+    print(f"   • Context Length:  {DEFAULT_PARAMS['context_length']}")
+    print(f"   • Eval Frequency:  {DEFAULT_PARAMS['eval_freq']}")
+    print("\n" + "-"*70)
+    print("💡 These settings work well for most continued training scenarios.")
+    print("="*70 + "\n")
+
+
+def load_finetuned_model(model_path, config_path, device):
     """Load a fine-tuned model for continued training."""
     print(f"📦 Loading model config from: {config_path}")
     with open(config_path, "r", encoding="utf-8") as f:
@@ -90,116 +221,306 @@ def load_model_for_continuation(model_path, config_path, device):
     model.train()  # Set to training mode for continued fine-tuning
     
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"✅ Model loaded successfully! ({total_params:,} parameters)")
+    print(f"✅ Fine-tuned model loaded successfully! ({total_params:,} parameters)")
     
-    return model, config
+    return model, config, "finetuned"
 
 
-def get_training_parameters():
-    """Get continued training parameters from user."""
-    print("\n" + "="*70)
-    print("⚙️  CONTINUED TRAINING PARAMETERS")
-    print("="*70)
-        
-    # New data option
-    print("\n📁 Data Options:")
-    print("   [1] Use existing instruction-data.json")
-    print("   [2] Use new/updated data file")
+def load_pretrained_model(model_choice, device):
+    """Load a fresh pretrained GPT-2 model from OpenAI."""
+    model_names = list(MODEL_CONFIGS.keys())
+    selected_name = model_names[model_choice - 1]
+    model_size = selected_name.split("(")[-1].rstrip(")")
     
-    while True:
-        data_choice = input("\nSelect data option (1-2, default=1): ").strip()
-        if data_choice in ["", "1"]:
-            data_file = "instruction-data.json"
-            break
-        elif data_choice == "2":
-            data_file = input("Enter new data file path: ").strip()
-            if not os.path.exists(data_file):
-                print(f"⚠️  File not found: {data_file}")
-                print("   Using default instruction-data.json instead")
-                data_file = "instruction-data.json"
-            break
-        else:
-            print("⚠️  Invalid choice")
+    print(f"\n🤖 Selected: {selected_name}")
+    print(f"📥 Downloading/loading pretrained weights for {model_size}...")
+    print("   (Files are cached locally after first download)\n")
     
-    params = {
-        "num_epochs": 2,
-        "learning_rate": 0.00005,
-        "batch_size": 8,
+    # Download and load pretrained weights
+    settings, params = download_and_load_gpt2(model_size=model_size, models_dir="gpt2_models")
+    
+    # Build config
+    BASE_CONFIG = {
+        "vocab_size": 50257,
         "context_length": 1024,
-        "eval_freq": 5,
-        "data_file": data_file
+        "drop_rate": 0.0,
+        "qkv_bias": True,
+        "emb_dim": MODEL_CONFIGS[selected_name]["emb_dim"],
+        "n_layers": MODEL_CONFIGS[selected_name]["n_layers"],
+        "n_heads": MODEL_CONFIGS[selected_name]["n_heads"],
     }
     
-    print("\n" + "-"*70)
-    print("✅ Training Parameters Summary:")
+    # Initialize model and load weights
+    model = GPTModel(BASE_CONFIG)
+    load_weights_into_gpt(model, params)
+    model.to(device)
+    model.train()  # Set to training mode
+    
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"✅ Pretrained model loaded successfully! ({total_params:,} parameters)")
+    
+    return model, BASE_CONFIG, "pretrained"
+
+
+def get_training_parameters(json_files):
+    """Get continued training parameters from user."""
+    print("\n" + "="*70)
+    print("⚙️  TRAINING PARAMETERS CONFIGURATION")
+    print("="*70)
+    
+    # Ask user if they want default or custom parameters
+    print("\n📌 Parameter Configuration Options:")
+    print("   [1] Use Default Parameters (Recommended for beginners)")
+    print("   [2] Enter Custom Parameters (Advanced users)")
+    
+    while True:
+        param_choice = input("\nSelect option (1-2, default=1): ").strip()
+        
+        if param_choice in ["", "1"]:
+            # Use default parameters
+            display_default_params()
+            confirm = input("Use these default settings? (Y/n, default=Y): ").strip().lower()
+            if confirm in ["", "y", "yes", "Y"]:
+                print("\n✅ Using DEFAULT parameters")
+                params = DEFAULT_PARAMS.copy()
+                break
+            else:
+                print("🔄 Returning to parameter selection...\n")
+                continue
+        elif param_choice == "2":
+            # Enter custom parameters
+            print("\n📝 Enter Custom Training Parameters:")
+            print("-"*70)
+            
+            # Number of additional epochs
+            while True:
+                try:
+                    epochs = input("\n📅 Number of additional epochs (default=2): ").strip()
+                    num_epochs = int(epochs) if epochs else 2
+                    if num_epochs > 0:
+                        break
+                    print("⚠️  Please enter a positive number")
+                except ValueError:
+                    print("⚠️  Invalid input. Please enter a number")
+            
+            # Learning rate
+            while True:
+                try:
+                    lr = input("📈 Learning rate (default=0.00005): ").strip()
+                    learning_rate = float(lr) if lr else 0.00005
+                    if learning_rate > 0:
+                        break
+                    print("⚠️  Please enter a positive number")
+                except ValueError:
+                    print("⚠️  Invalid input. Please enter a number")
+            
+            # Batch size
+            while True:
+                try:
+                    bs = input("📦 Batch size (default=8): ").strip()
+                    batch_size = int(bs) if bs else 8
+                    if batch_size > 0:
+                        break
+                    print("⚠️  Please enter a positive number")
+                except ValueError:
+                    print("⚠️  Invalid input. Please enter a number")
+            
+            # Context length
+            while True:
+                try:
+                    cl = input("📝 Context length (default=1024): ").strip()
+                    context_length = int(cl) if cl else 1024
+                    if context_length > 0:
+                        break
+                    print("⚠️  Please enter a positive number")
+                except ValueError:
+                    print("⚠️  Invalid input. Please enter a number")
+            
+            # Evaluation frequency
+            while True:
+                try:
+                    ef = input("📊 Evaluation frequency (default=5): ").strip()
+                    eval_freq = int(ef) if ef else 5
+                    if eval_freq > 0:
+                        break
+                    print("⚠️  Please enter a positive number")
+                except ValueError:
+                    print("⚠️  Invalid input. Please enter a number")
+            
+            params = {
+                "num_epochs": num_epochs,
+                "learning_rate": learning_rate,
+                "batch_size": batch_size,
+                "context_length": context_length,
+                "eval_freq": eval_freq,
+            }
+            
+            print("\n✅ Using CUSTOM parameters")
+            break
+        else:
+            print("⚠️  Invalid choice. Please enter 1 or 2.")
+    
+    # Data file selection - Display available JSON files
+    print("\n📁 Data File Selection:")
+    
+    if json_files:
+        display_json_selection(json_files)
+        
+        while True:
+            data_choice = input(f"Select a data file (1-{len(json_files)}, default=1): ").strip()
+            
+            if data_choice == "":
+                data_choice = "1"
+            
+            try:
+                idx = int(data_choice) - 1
+                if 0 <= idx < len(json_files):
+                    data_file = json_files[idx]
+                    print(f"\n✅ Selected: {data_file}")
+                    break
+                else:
+                    print("⚠️  Invalid selection. Please try again.")
+            except ValueError:
+                print("⚠️  Invalid input. Please enter a number.")
+    else:
+        print("⚠️  No JSON files found in current directory.")
+        print("   Please add a training data file (e.g., instruction-data.json)")
+        data_file = input("   Or enter custom file path: ").strip()
+        if not data_file:
+            data_file = "instruction-data.json"
+    
+    params["data_file"] = data_file
+    
+    print("\n" + "="*70)
+    print("✅ TRAINING PARAMETERS SUMMARY")
+    print("="*70)
     for key, value in params.items():
         print(f"   • {key}: {value}")
-    print("-"*70 + "\n")
+    print("="*70 + "\n")
     
     return params
 
 
 def main():
-    # ========== STEP 1: Find Saved Models ==========
-    print("🔍 Searching for fine-tuned models...\n")
+    # ========== STEP 1: Select Model Source ==========
+    display_model_source_selection()
     
-    model_files = find_saved_models()
-    
-    if not model_files:
-        print("✗ No fine-tuned models found (*.pth files ending with '-sft-standalone.pth')")
-        print("💡 Please run main.py first to train and save a model.\n")
-        sys.exit(1)
-    
-    # Display available models
-    display_model_selection(model_files)
-    
-    # Get user selection
     while True:
-        choice = input(f"Select a model (1-{len(model_files)}) or 'q' to quit: ").strip().lower()
+        source_choice = input("Select model source (1-2) or 'q' to quit: ").strip().lower()
         
-        if choice == 'q':
-            print("👋 Continued training cancelled. Goodbye!")
+        if source_choice == 'q':
+            print("👋 Training cancelled. Goodbye!")
             sys.exit(0)
-        
-        try:
-            idx = int(choice) - 1
-            if 0 <= idx < len(model_files):
-                selected_file = model_files[idx]
-                break
-            else:
-                print("✗ Invalid selection. Please try again.")
-        except ValueError:
-            print("✗ Invalid input. Please enter a number or 'q'.")
+        elif source_choice in ["", "1"]:
+            model_source = "finetuned"
+            break
+        elif source_choice == "2":
+            model_source = "pretrained"
+            break
+        else:
+            print("⚠️  Invalid choice. Please enter 1, 2, or 'q'.")
     
-    print(f"\n✅ Selected: {selected_file}\n")
-    
-    # Derive config file path
-    config_file = selected_file.replace(".pth", "_config.json")
-    if not os.path.exists(config_file):
-        print(f"✗ Config file not found: {config_file}")
-        print("💡 Please ensure the _config.json file exists alongside the .pth file.\n")
-        sys.exit(1)
-    
-    # ========== STEP 2: Setup Device ==========
+    # ========== STEP 2: Load Model ==========
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"🔧 Device: {device}")
+    print(f"\n🔧 Device: {device}")
     if device.type == "cpu":
         print("⚠️  Training on CPU will be slow. Consider using a GPU for faster results.\n")
     print(50*"-")
     
-    # ========== STEP 3: Load Model ==========
-    print("📦 Loading fine-tuned model for continued training...")
-    try:
-        model, config = load_model_for_continuation(selected_file, config_file, device)
-    except Exception as e:
-        print(f"✗ Error loading model: {e}")
-        sys.exit(1)
+    if model_source == "finetuned":
+        # Find and select fine-tuned model
+        print("🔍 Searching for fine-tuned models...\n")
+        model_files = find_saved_models()
+        
+        if not model_files:
+            print("✗ No fine-tuned models found (*.pth files ending with '-sft-standalone.pth' or '-sft-continued.pth')")
+            print("💡 Please run main.py first to train and save a model, or choose Option [2] for pretrained model.\n")
+            sys.exit(1)
+        
+        display_finetuned_models(model_files)
+        
+        # Get user selection
+        while True:
+            choice = input(f"Select a model (1-{len(model_files)}) or 'q' to quit: ").strip().lower()
+            
+            if choice == 'q':
+                print("👋 Training cancelled. Goodbye!")
+                sys.exit(0)
+            
+            try:
+                idx = int(choice) - 1
+                if 0 <= idx < len(model_files):
+                    selected_file = model_files[idx]
+                    break
+                else:
+                    print("✗ Invalid selection. Please try again.")
+            except ValueError:
+                print("✗ Invalid input. Please enter a number or 'q'.")
+        
+        print(f"\n✅ Selected: {selected_file}\n")
+        
+        # Derive config file path
+        config_file = selected_file.replace(".pth", "_config.json")
+        if not os.path.exists(config_file):
+            print(f"✗ Config file not found: {config_file}")
+            print("💡 Please ensure the _config.json file exists alongside the .pth file.\n")
+            sys.exit(1)
+        
+        # Load fine-tuned model
+        print("📦 Loading fine-tuned model...")
+        try:
+            model, config, model_type = load_finetuned_model(selected_file, config_file, device)
+        except Exception as e:
+            print(f"✗ Error loading model: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+    
+    else:  # pretrained
+        display_pretrained_models()
+        
+        # Get user selection
+        while True:
+            choice = input(f"Select a model (1-4) or 'q' to quit: ").strip().lower()
+            
+            if choice == 'q':
+                print("👋 Training cancelled. Goodbye!")
+                sys.exit(0)
+            
+            try:
+                idx = int(choice) - 1
+                if 0 <= idx < len(MODEL_CONFIGS):
+                    break
+                else:
+                    print("✗ Invalid selection. Please try again.")
+            except ValueError:
+                print("✗ Invalid input. Please enter a number or 'q'.")
+        
+        # Load pretrained model
+        print("📦 Loading pretrained GPT-2 model...")
+        try:
+            model, config, model_type = load_pretrained_model(idx + 1, device)
+            selected_file = None  # No saved file for pretrained
+        except Exception as e:
+            print(f"✗ Error loading model: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+    
+    # ========== STEP 3: Find Available JSON Files ==========
+    print("\n🔍 Searching for JSON training data files...\n")
+    json_files = find_json_files()
     
     # ========== STEP 4: Get Training Parameters ==========
-    train_params = get_training_parameters()
+    train_params = get_training_parameters(json_files)
     
     # ========== STEP 5: Load and Prepare Data ==========
     print(f"📥 Loading instruction data from: {train_params['data_file']}...")
+    
+    if not os.path.exists(train_params["data_file"]):
+        print(f"✗ File not found: {train_params['data_file']}")
+        sys.exit(1)
+    
     data = load_file(train_params["data_file"])
     print(f"✓ Loaded {len(data)} instruction examples\n")
 
@@ -247,17 +568,17 @@ def main():
     print("✓ Data loaders ready\n")
 
     # ========== STEP 7: Initial Loss Evaluation ==========
-    print("📈 Evaluating initial losses (before continued training)...")
+    print("📈 Evaluating initial losses (before training)...")
     with torch.no_grad():
-        train_loss = calc_loss_loader(train_loader, model, device, num_batches=5)
-        val_loss = calc_loss_loader(val_loader, model, device, num_batches=5)
+        train_loss = calc_loss_loader(train_loader, model, device, num_batches=5, show_progress=True)
+        val_loss = calc_loss_loader(val_loader, model, device, num_batches=5, show_progress=True)
 
     print(f"   Training loss:   {train_loss:.3f}")
     print(f"   Validation loss: {val_loss:.3f}")
     print(50*"-")
 
-    # ========== STEP 8: Continued Fine-Tuning ==========
-    print("🚀 Starting continued fine-tuning...\n")
+    # ========== STEP 8: Fine-Tuning ==========
+    print("🚀 Starting fine-tuning...\n")
     start_time = time.time()
     
     optimizer = torch.optim.AdamW(
@@ -279,57 +600,43 @@ def main():
 
     end_time = time.time()
     execution_time_minutes = (end_time - start_time) / 60
-    print(f"\n✅ Continued training completed in {execution_time_minutes:.2f} minutes.")
+    print(f"\n✅ Training completed in {execution_time_minutes:.2f} minutes.")
 
     # ========== STEP 9: Plot and Save ==========
     print("📊 Generating loss plot...")
-    epochs_tensor = torch.linspace(0, num_epochs, len(train_losses))
-    plot_name = selected_file.replace(".pth", "-continued-loss-plot.pdf")
-    plot_losses(epochs_tensor, tokens_seen, train_losses, val_losses, save_path=plot_name)
+    epochs_tensor = torch.linspace(0, num_epochs, len(train_losses))    
+    plot_losses(epochs_tensor, tokens_seen, train_losses, val_losses)
     print(50*"-")
 
-    # Save the continued fine-tuned model with new name
-    base_name = selected_file.replace("-sft-standalone.pth", "")
-    new_file_name = f"{base_name}-sft-continued.pth"
-    
-    # Ensure unique filename
-    counter = 1
-    while os.path.exists(new_file_name):
-        new_file_name = f"{base_name}-sft-continued-v{counter}.pth"
-        counter += 1
+    # Save the fine-tuned model with new name
+    if model_type == "finetuned":
+        base_name = selected_file.replace("-sft-standalone.pth", "").replace("-sft-continued.pth", "")
+        new_file_name = f"{base_name}-sft-continued.pth"
+        
+        # Ensure unique filename
+        counter = 1
+        while os.path.exists(new_file_name):
+            new_file_name = f"{base_name}-sft-continued-v{counter}.pth"
+            counter += 1
+    else:
+        model_size = config["emb_dim"]
+        new_file_name = f"gpt2-{model_size}-sft-standalone.pth"
+        
+        # Ensure unique filename
+        counter = 1
+        while os.path.exists(new_file_name):
+            new_file_name = f"gpt2-{model_size}-sft-standalone-v{counter}.pth"
+            counter += 1
     
     torch.save(model.state_dict(), new_file_name)
     print(f"💾 Model saved as: {new_file_name}")
-    
-    # Save config (same config, but update file)
-    config_file_new = new_file_name.replace(".pth", "_config.json")
-    with open(config_file_new, "w") as f:
-        json.dump(config, f, indent=2)
-    print(f"⚙️  Config saved as: {config_file_new}")
-    
-    # Save training metadata
-    metadata = {
-        "original_model": selected_file,
-        "continued_epochs": num_epochs,
-        "learning_rate": train_params["learning_rate"],
-        "batch_size": batch_size,
-        "context_length": train_params["context_length"],
-        "training_time_minutes": execution_time_minutes,
-        "final_train_loss": train_losses[-1] if train_losses else None,
-        "final_val_loss": val_losses[-1] if val_losses else None
-    }
-    metadata_file = new_file_name.replace(".pth", "_metadata.json")
-    with open(metadata_file, "w") as f:
-        json.dump(metadata, f, indent=2)
-    print(f"📝 Training metadata saved as: {metadata_file}")
-    
+        
     print("\n" + "🎉"*35)
-    print(f"Continued fine-tuning complete!")
-    print(f"Your model has been trained for {num_epochs} additional epochs.")
+    print(f"Fine-tuning complete!")
+    print(f"Your model has been trained for {num_epochs} epochs.")
     print("🎉"*35 + "\n")
     
     return model, tokenizer, config
-
 
 if __name__ == "__main__":
     main()
